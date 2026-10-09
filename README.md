@@ -21,7 +21,7 @@ It was preceded by: Java was struggling to free memory (GC thrashing) at 14:12:1
   - Backed up by a restart at 14:26:12.
 ```
 
-See [`examples/sample_report.html`](examples/sample_report.html) for a full report.
+See [`examples/sample_report.html`](examples/sample_report.html) (app crash) and [`examples/sample_report_splunk_internal.html`](examples/sample_report_splunk_internal.html) (splunkd crash, from Splunk's own logs) for full reports.
 
 ---
 
@@ -47,6 +47,7 @@ python examples/generate_samples.py        # also creates the large CSV scenario
 python splunk_log_analyzer.py -f examples/samples/app.log examples/samples/syslog.log -t "2026-10-09 14:30" -r "server crashed"
 python splunk_log_analyzer.py -f examples/samples/splunk_export.csv  -t "2026-10-09 10:25" -r "website down, users getting errors"
 python splunk_log_analyzer.py -f examples/samples/splunk_export.json -t "2026-10-09 18:10" -r "splunk not receiving data"
+python splunk_log_analyzer.py -f examples/samples/splunk_home/var/log/splunk/ -t "2026-10-09 14:10" -r "splunk went down, searches not working"
 ```
 
 | Scenario | What the tool concludes |
@@ -54,6 +55,7 @@ python splunk_log_analyzer.py -f examples/samples/splunk_export.json -t "2026-10
 | A — `app.log` + `syslog.log` | Deployment → GC thrashing → Java out of memory → OS OOM-killer → 4.5 min log silence → restart |
 | B — Splunk CSV (72k rows) | Bot flood from one IP (75% of traffic) → app02 out of memory → nginx 502s → 54% of user requests failed |
 | C — Splunk JSON | Indexer disk below `minFreeSpace` → indexing paused → queues blocked (symptom) |
+| D — `splunk_home/var/log/splunk/` folder | Queue backlog and red health report (warning signs) → **splunkd crashed** (`crash-*.log`, `Last errno: 12` = out of memory) → all 5 log files silent together for 4 min → restart → scheduled searches skipped |
 
 ---
 
@@ -76,10 +78,12 @@ Confidence is **High / Medium / Low / Inconclusive**, with the reasons listed.
 |---|---|
 | Splunk CSV export | Uses `_time`, `_raw`, `host`, `source`, `sourcetype`, level fields |
 | Splunk JSON / JSON-lines export | `{"result": {...}}` rows, REST `{"results": [...]}`, generic JSON app logs |
-| Raw text | Java/Tomcat, Python, .NET, nginx/Apache/IIS, syslog/journal, splunkd.log, Windows event text |
+| Plain log files, as they are | No conversion needed — `.log`, `.txt`, `.gz`. Java/Tomcat, Python, .NET, nginx/Apache/IIS, syslog/journal, Windows event text |
+| Splunk's own logs (`$SPLUNK_HOME/var/log/splunk/`) | `splunkd.log`, `metrics.log`, `scheduler.log`, `health.log`, `audit.log`, `splunkd_access.log`, `web_service.log`, `mongod.log` (KV store), `crash-*.log` — see below |
 | Encodings | UTF-8, UTF-8 BOM, UTF-16 (Windows exports), `.gz` |
 | Multi-line | Stack traces are attached to their parent event |
-| Several files / folder / wildcard | `-f app.log db.log`, `-f logs/`, `-f "logs/*.log"` |
+| Several files / folder / wildcard | `-f app.log db.log`, `-f logs/` (subfolders included), `-f "logs/*.log"` |
+| Rotated files | `splunkd.log.1` … `.5`, `access.log.2026-10-08.gz` are read oldest-first and treated as one source; files entirely outside the time window are skipped without reading |
 
 Timestamp formats recognised include ISO-8601 (with offsets), `MM-DD-YYYY HH:MM:SS.mmm +0000` (splunkd), `M/D/YYYY h:mm:ss AM` (Windows), Apache `[09/Oct/2026:14:23:45 +0530]`, Tomcat `09-Oct-2026 14:23:45`, Java `Oct 09, 2026 2:23:45 PM`, ctime, syslog (`Oct  9 14:23:45`), and epoch seconds/ms in `_time`.
 
@@ -103,6 +107,37 @@ Timestamp formats recognised include ISO-8601 (with offsets), `MM-DD-YYYY HH:MM:
 | `--open` | off | Open the HTML report in your browser |
 
 Passwords, tokens, API keys and `Bearer` credentials in evidence lines are **always** masked.
+
+## Splunk's own logs (`$SPLUNK_HOME/var/log/splunk`)
+
+When Splunk itself is the problem (indexing stopped, searches failing, forwarders backing up, splunkd down), point the tool at Splunk's internal log folder on the affected server. Copy it off the box first if you prefer; nothing needs converting.
+
+```bash
+# Indexer / search head (default install path)
+python splunk_log_analyzer.py -f /opt/splunk/var/log/splunk/ -t "2026-10-09 14:10" -r "splunk went down"
+
+# Universal forwarder
+python splunk_log_analyzer.py -f /opt/splunkforwarder/var/log/splunk/ -t "2026-10-09 14:10" -r "forwarder not sending data"
+
+# Windows
+python splunk_log_analyzer.py -f "C:\Program Files\Splunk\var\log\splunk" -t "10/09/2026 2:10 PM" -r "splunk down"
+```
+
+What it picks up from these files:
+
+| File | What it contributes |
+|---|---|
+| `crash-*.log` | splunkd crashes: fatal signal, crashing thread, `Last errno` (12 = out of memory) |
+| `splunkd.log` (+ rotated `.1`–`.5`) | Queue blocks (`Could not send data to output queue`, `Queues blocked for more than…`), forwarder/indexer connection failures, `DiskMon` / `minFreeSpace` pauses, cluster peer down / replication failures, license warnings, KV store errors, starts and shutdowns |
+| `metrics.log` | `blocked=true` queue metrics |
+| `health.log` | Health report features turning `color=red` |
+| `scheduler.log` | Skipped scheduled searches and the reason |
+| `audit.log` | Failed logins |
+| `splunkd_access.log` | REST/API traffic and 5xx errors |
+| `mongod.log` | KV store errors (old text and new JSON format) |
+| all of them | When **all** of them go quiet at the same moment, splunkd (or the server) was down — reported as one event |
+
+Tip: copy the whole folder, not just `splunkd.log` — the crash log and the "everything went silent together" signal are often what proves the cause. The folder can be several hundred MB; rotated files outside your time window are skipped, so a typical run takes seconds to a minute.
 
 ## Exporting from Splunk
 

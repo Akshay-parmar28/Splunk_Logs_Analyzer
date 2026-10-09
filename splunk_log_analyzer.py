@@ -21,15 +21,22 @@ HOW IT DECIDES
      (before vs after your time) x novelty (new vs normal).
 
 WORKS WITH
-  * Splunk exports: CSV (_raw/_time columns), JSON / JSON-lines, raw text
-  * Plain logs: Java/Tomcat, Python, .NET, nginx/Apache/IIS, Linux syslog,
-    Windows event exports, splunkd.log, JSON app logs
-  * .gz files, UTF-8/UTF-16, multi-line stack traces, several files at once
+  * Plain log files as they are - no conversion needed (.log, .txt, .gz)
+  * Splunk's own logs: point -f at $SPLUNK_HOME/var/log/splunk/ (splunkd.log,
+    metrics.log, scheduler.log, health.log, audit.log, splunkd_access.log,
+    mongod.log, crash-*.log, rotated splunkd.log.1 ...)
+  * Splunk search exports: CSV (_raw/_time columns), JSON / JSON-lines, raw
+  * App/OS logs: Java/Tomcat, Python, .NET, nginx/Apache/IIS, Linux syslog,
+    Windows event exports, JSON app logs
+  * Folders (searched recursively), wildcards, .gz, UTF-8/UTF-16,
+    multi-line stack traces. Rotated files are joined; binary files and
+    files entirely outside the time window are skipped.
 
 QUICK START
   python splunk_log_analyzer.py                        (asks you questions)
   python splunk_log_analyzer.py -f export.csv -t "2026-10-09 14:30" -r "server went down"
   python splunk_log_analyzer.py -f app.log syslog.gz -t "today 2:30 PM" -r "site very slow" --open
+  python splunk_log_analyzer.py -f /opt/splunk/var/log/splunk/ -t "today 14:10" -r "splunk went down"
 
 TIME FORMATS FOR -t
   "2026-10-09 14:30"   "10/09/2026 2:30 PM"   "09-Oct-2026 14:30"
@@ -123,8 +130,30 @@ class TimeParser(object):
         self.last = 0                        # index of the last pattern that worked
         self.offsets = collections.Counter()
         self.yearless = 0
+        self._cache = {}                     # timestamp text (without fraction) -> parsed parts
 
-    def _build(self, m):
+    def _build_cached(self, m):
+        """Many lines share the same second: reuse the parsed date, only the fraction differs."""
+        head = m.string
+        fs, fe = m.span("f")
+        if fs >= 0:
+            key = (m.re.pattern, head[m.start():fs - 1] + head[fe:m.end()])
+        else:
+            key = (m.re.pattern, head[m.start():m.end()])
+        hit = self._cache.get(key)
+        if hit is None:
+            hit = self._build(m, with_fraction=False)
+            if len(self._cache) > 20000:
+                self._cache.clear()
+            self._cache[key] = hit or False
+        if not hit:
+            return None
+        if fs >= 0:
+            frac = head[fs:fe]
+            return hit[0].replace(microsecond=int((frac + "000000")[:6])), hit[1], hit[2]
+        return hit
+
+    def _build(self, m, with_fraction=True):
         g = m.groupdict()
         try:
             if g.get("Mon"):
@@ -153,7 +182,7 @@ class TimeParser(object):
                     hh = 0
                 if ampm[0] in "Pp":
                     hh += 12
-            frac = g.get("f")
+            frac = g.get("f") if with_fraction else None
             us = int((frac + "000000")[:6]) if frac else 0
             d = dt.datetime(year, mon, day, hh, mi, ss, us)
         except (ValueError, TypeError):
@@ -175,7 +204,7 @@ class TimeParser(object):
             return None
         m = TS_REGEXES[self.last].search(head)
         if m is not None and m.start() <= 30:
-            r = self._build(m)
+            r = self._build_cached(m)
             if r is not None:
                 return r + (m.span(),)
         cands = []
@@ -284,8 +313,8 @@ SIGNATURE_TABLE = [
      "The server (or container) ran out of RAM, so the operating system force-killed a process to survive. That process stopped instantly.",
      "Find which process was killed (see evidence), check its memory limit, and what else was using RAM at that time."),
     ("native_oom", "memory", "critical", "Program could not get more memory",
-     r"System\.OutOfMemoryException|Cannot allocate memory|std::bad_alloc|\bMemoryError\b|\bENOMEM\b|failed to allocate|Insufficient (system )?memory|unable to allocate",
-     "A program asked the system for memory and was refused. It usually crashes or fails the operation.",
+     r"System\.OutOfMemoryException|Cannot allocate memory|std::bad_alloc|\bMemoryError\b|\bENOMEM\b|failed to allocate|Insufficient (system )?memory|unable to allocate|Last errno: 12\b",
+     "A program asked the system for memory and was refused (in a Splunk crash log, 'Last errno: 12' means exactly this). It usually crashes or fails the operation.",
      "Check free RAM / swap and memory limits for the process or container at that time."),
     ("win_low_mem", "memory", "high", "Windows reported low memory",
      r"Resource-Exhaustion-Detector|low virtual memory condition|EventCode=2004\b",
@@ -319,7 +348,7 @@ SIGNATURE_TABLE = [
      "Find the slow consumer/downstream system and check for a burst of incoming work."),
     # ---------------- OS / kernel ----------------
     ("hung_task", "kernel", "high", "Operating system reported a frozen task",
-     r"blocked for more than \d+ seconds|hung_task|soft lockup|hard LOCKUP|rcu_sched .{0,30}stall|rcu_preempt .{0,30}stall",
+     r"task \S+ blocked for more than \d+ seconds|hung_task|soft lockup|hard LOCKUP|rcu_sched .{0,30}stall|rcu_preempt .{0,30}stall",
      "Something on the server was stuck for a long time (often waiting on disk or a busy CPU). The server can appear frozen.",
      "Check disk/storage latency and CPU at that time; check the VM host / hypervisor health."),
     ("unexpected_shutdown", "kernel", "critical", "Server shut down or rebooted unexpectedly",
@@ -474,7 +503,7 @@ SIGNATURE_TABLE = [
      "Find the dependency named in the evidence - its failures are the real problem."),
     # ---------------- Splunk platform ----------------
     ("splunk_queue", "splunk", "high", "Splunk processing queues blocked",
-     r"blocked=true|(parsingQueue|aggQueue|typingQueue|indexQueue|tcpin_queue|splunktcpin)\b.{0,60}(blocked|full)|TcpOutputProc .{0,80}(blocked|paused)|Forwarding to (indexer|output) group .{0,60}(blocked|paused)",
+     r"blocked=true|(parsingQueue|aggQueue|typingQueue|indexQueue|tcpin_queue|splunktcpin)\b.{0,60}(blocked|full)|TcpOutputProc .{0,80}(blocked|paused)|Forwarding to (indexer|output) group .{0,60}(blocked|paused)|Could not send data to output queue|Queues? (has been )?blocked for more than",
      "Splunk could not push data through its pipeline fast enough, so queues filled up. Indexing slows or stops and forwarders back up.",
      "Check indexer disk speed/space and CPU, and whether one indexer is down so the others are overloaded."),
     ("splunk_fwd", "splunk", "high", "Splunk forwarder could not send data to indexers",
@@ -493,6 +522,18 @@ SIGNATURE_TABLE = [
      r"[Ll]icense (warning|violation)|licenser .{0,40}(exceeded|violation|over quota)|daily indexing volume limit",
      "Splunk indexed more data than the license allows. Repeated violations can block searching.",
      "Find the source that sent unusual volume that day."),
+    ("splunk_crash", "process", "critical", "splunkd crashed (fatal signal, crash log written)",
+     r"Received fatal signal \d+|Crashing thread:",
+     "The Splunk server process (splunkd) crashed and wrote a crash-*.log file. Until it restarts, it does not index, search or accept forwarder data.",
+     "Open the crash-*.log shown in the evidence: note the signal, 'Crashing thread' and 'Last errno' (12 = out of memory). Check memory/ulimits and search load at that time; send the crash log to Splunk Support if it repeats."),
+    ("splunk_health", "splunk", "high", "Splunk health report turned red",
+     r"PeriodicHealthReporter .{0,200}color=red|health (status|report) .{0,60}\bred\b",
+     "Splunk's built-in health check flagged a component as red (the evidence names which feature, e.g. ingestion latency, queues, search scheduler).",
+     "Look at the feature named in the evidence and the matching messages in splunkd.log at the same time."),
+    ("splunk_cluster", "splunk", "high", "Splunk cluster or search-peer problem",
+     r"\bpeer\b.{0,80}(status=Down|is Down|\bDown\b|went down|has gone down|not responding|unavailable)|Unable to distribute to peer|replication .{0,60}(failed|unsuccessful|error)|(searchable|replicated) copies .{0,40}(not met|unmet)|No leader|captain .{0,60}(lost|not elected|unavailable|election)",
+     "Nodes in the Splunk cluster lost contact with each other (an indexer or search peer went down, or replication failed). Searches may return incomplete results.",
+     "Check which peer is named in the evidence: is it up, reachable on its management port (8089) and replication port, and did it restart at that time?"),
     ("splunk_service", "splunk", "high", "Splunk service problem (splunkd / KV store)",
      r"splunkd .{0,30}(crash|exited|terminated|not responding|stopped)|crash-\d{4}-\d{2}-\d{2}|KV ?Store .{0,40}(fail|error|not ready|unavailable)|mongod .{0,40}(exit|fail|terminated)|HTTPServer .{0,40}(failed|Error binding)",
      "A core Splunk component crashed or was not working.",
@@ -511,7 +552,7 @@ SIG_KEYWORDS = {
     "gc_thrash": ("gc overhead", "full gc", "pause full", "to-space exhausted", "concurrent mode failure"),
     "os_oom_kill": ("out of memory", "oom-kill", "oom_reaper", "memory cgroup", "oomkilled"),
     "native_oom": ("outofmemoryexception", "cannot allocate memory", "bad_alloc", "memoryerror", "enomem",
-                   "failed to allocate", "insufficient", "unable to allocate"),
+                   "failed to allocate", "insufficient", "unable to allocate", "last errno: 12"),
     "win_low_mem": ("resource-exhaustion", "low virtual memory", "eventcode=2004"),
     "disk_full": ("no space left", "enospc", "not enough space", "insufficient disk", "quota exceeded", "full"),
     "disk_io": ("i/o error", "ext4-fs error", "xfs", "blk_update_request", "read-only", "bad sector", "eventcode="),
@@ -575,6 +616,9 @@ SIG_KEYWORDS = {
     "null_ref": ("nullpointer", "nullreference", "object reference not set", "cannot read propert", "nonetype"),
     "circuit_open": ("circuit", "short-circuited", "hystrix"),
     "splunk_queue": ("blocked", "queue", "splunktcpin", "tcpoutputproc", "forwarding to"),
+    "splunk_crash": ("received fatal signal", "crashing thread:"),
+    "splunk_health": ("color=red", "health status", "health report"),
+    "splunk_cluster": ("peer", "replication", "no leader", "captain", "searchable copies", "bucket fixup"),
     "splunk_fwd": ("tcpoutputfd", "cooked connection", "quarantine", "expecting ack", ":9997", "indexer"),
     "splunk_disk": ("minfreespace", "diskmon", "disk space", "diskspace", "indexwriter", "indexing has been paused"),
     "splunk_search": ("status=skipped", "concurrent", "scheduled search", "dispatchmanager"),
@@ -586,7 +630,8 @@ SIG_KEYWORDS = {
 
 # These describe what users/other systems FELT rather than WHY - ranked lower than causes.
 SYMPTOMS = {"bad_gateway", "unavailable_503", "rate_limited", "conn_refused", "timeout",
-            "conn_reset", "circuit_open", "queue_backlog", "http_5xx", "traffic_drop", "splunk_queue"}
+            "conn_reset", "circuit_open", "queue_backlog", "http_5xx", "traffic_drop", "splunk_queue",
+            "splunk_fwd", "splunk_health"}
 SEV_WEIGHT = {"critical": 5, "high": 3, "medium": 2, "low": 1, "info": 0}
 NOVELTY = {"NEW": 1.6, "SPIKE": 1.25, "UNKNOWN": 1.0, "ELEVATED": 0.8, "NORMAL": 0.3}
 STATUS_ORDER = {"NEW": 0, "SPIKE": 1, "UNKNOWN": 2, "ELEVATED": 3, "NORMAL": 4}
@@ -692,7 +737,9 @@ def detect_level(line):
 
 
 _SYSLOG_HOST = re.compile(r"^\s*(?P<host>[A-Za-z0-9][\w.-]{0,62})\s+[\w./-]+(?:\[\d+\])?:\s")
-_KV_HOST = re.compile(r"\b(?:ComputerName|hostname|host_name|host)=\"?([A-Za-z0-9][\w.-]{0,62})")
+# Only explicit "which machine logged this" fields. A bare host=... inside a message is usually a
+# destination or context (e.g. splunkd "Connection to host=10.0.2.5:9997 failed"), so it is ignored.
+_KV_HOST = re.compile(r"\b(?:ComputerName|hostname|host_name|Computer)=\"?([A-Za-z0-9][\w.-]{0,62})")
 
 
 def guess_host(line, span):
@@ -777,11 +824,14 @@ def clean_text(s, redact):
     return s
 
 
+_EVIDENCE_KEY = re.compile(r"Caused by|Last errno|Crashing thread|Received fatal signal|OutOfMemory|bad_alloc")
+
+
 def evidence_text(text, max_lines=6, max_chars=900):
     lines = text.split("\n")
     out = lines[:max_lines]
     if len(lines) > max_lines:
-        caused = [l for l in lines[max_lines:] if "Caused by" in l][:2]
+        caused = [l for l in lines[max_lines:] if _EVIDENCE_KEY.search(l)][:3]
         if caused:
             out += ["\t..."] + caused
         else:
@@ -821,7 +871,14 @@ def sniff_format(path):
             if not s:
                 continue
             if s[0] in "[{":
-                return "json"
+                try:
+                    json.loads(s)
+                    return "json"                      # JSON lines
+                except ValueError:
+                    pass
+                if s in ("[", "{") or s.startswith(("[{", "[ {", '["', '{"', "{'")):
+                    return "json"                      # pretty-printed JSON document
+                return "raw"                           # e.g. "[build abc] 2026-..." or "[Fri Oct 09 ...]"
             low = s.lower()
             if ("_raw" in low or "_time" in low) and ("," in s or "\t" in s) and len(s) < 4000:
                 return "csv"
@@ -879,6 +936,7 @@ _J_MSG = ("_raw", "message", "msg", "log", "event", "text", "description")
 _J_LEVEL = ("log_level", "level", "severity", "loglevel", "levelname", "lvl")
 _J_HOST = ("host", "hostname", "computer", "computername", "server")
 _J_SRC = ("source", "sourcetype", "logger", "logger_name", "service", "app")
+_MONGO_LEVEL = {"F": "FATAL", "E": "ERROR", "W": "WARN", "I": "INFO", "D": "DEBUG"}
 
 
 def _json_record(obj):
@@ -906,7 +964,18 @@ def _json_record(obj):
     if msg is None:
         msg = json.dumps(obj, ensure_ascii=False)
     t = pick(_J_TIME)
-    return (str(msg), str(t) if t is not None else None, pick(_J_HOST), pick(_J_SRC), pick(_J_LEVEL))
+    if t is None and isinstance(low.get("t"), dict):          # MongoDB / Splunk KV store (mongod.log)
+        t = low["t"].get("$date")
+        if isinstance(t, dict):
+            t = t.get("$numberLong")
+    if isinstance(t, (dict, list)):
+        t = None
+    level = pick(_J_LEVEL)
+    if level is None and isinstance(low.get("s"), str):
+        level = _MONGO_LEVEL.get(low["s"].upper())
+    if isinstance(low.get("attr"), dict) and msg is not None and low.get("msg") is not None:
+        msg = "%s %s" % (msg, json.dumps(low["attr"], ensure_ascii=False))
+    return (str(msg), str(t) if t is not None else None, pick(_J_HOST), pick(_J_SRC), level)
 
 
 def iter_json(path):
@@ -935,8 +1004,13 @@ def iter_json(path):
                 if rec is not None:
                     yield ("line %d" % n,) + rec
         return
-    with open_text(path) as fh:
-        data = json.load(fh)
+    try:
+        with open_text(path) as fh:
+            data = json.load(fh)
+    except ValueError:
+        for rec in iter_raw(path):
+            yield rec
+        return
     rows = data
     if isinstance(data, dict):
         rows = data.get("results") or data.get("result") or data.get("events") or [data]
@@ -954,6 +1028,71 @@ def iter_records(path, fmt):
     if fmt == "json":
         return iter_json(path)
     return iter_raw(path)
+
+
+_ROT_SUFFIX = re.compile(r"(?:\.\d{1,3}|[._-]\d{4}-?\d{2}-?\d{2}(?:[._-]?\d{2,6})?)+$")
+SKIP_EXT = (".pid", ".lock", ".swp", ".tmp", ".db", ".sqlite", ".tsidx", ".zip", ".tar", ".tgz", ".7z", ".rar",
+            ".png", ".jpg", ".jpeg", ".gif", ".exe", ".dll", ".so", ".bin", ".dat", ".idx", ".pyc", ".class", ".jar")
+
+
+def log_base_name(name):
+    """splunkd.log.3 -> splunkd.log ; access.log.2026-10-08.gz -> access.log (rotated parts = one source)."""
+    n = re.sub(r"\.gz$", "", name, flags=re.I)
+    base = _ROT_SUFFIX.sub("", n)
+    return base or n
+
+
+def rotation_key(path):
+    """Sort key so rotated files are read oldest first: x.log.5, x.log.4 ... x.log.1, x.log"""
+    name = os.path.basename(path)
+    n = re.sub(r"\.gz$", "", name, flags=re.I)
+    base = log_base_name(name)
+    suffix = n[len(base):]
+    m = re.match(r"^\.(\d{1,3})$", suffix)
+    if m:
+        order = (0, -int(m.group(1)), "")
+    elif suffix:
+        order = (0, 0, suffix)          # date-stamped: oldest date first
+    else:
+        order = (1, 0, "")              # the live file last
+    return (os.path.dirname(path), base, order)
+
+
+def looks_binary(path):
+    try:
+        opener = gzip.open if path.lower().endswith(".gz") else open
+        with opener(path, "rb") as fh:
+            head = fh.read(4096)
+    except (IOError, OSError, EOFError):
+        return True
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return False                    # UTF-16 text
+    return b"\x00" in head
+
+
+def quick_time_range(path, tp):
+    """First and last timestamp of a plain-text file without reading all of it (None if unknown)."""
+    if path.lower().endswith(".gz"):
+        return None, None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(65536)
+            fh.seek(max(0, size - 65536))
+            tail = fh.read(65536)
+    except (IOError, OSError):
+        return None, None
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return None, None
+
+    def scan(blob, reverse):
+        lines = blob.decode("utf-8", "replace").splitlines()
+        for ln in (reversed(lines) if reverse else lines):
+            r = tp.parse_raw(ln)
+            if r is not None:
+                return tp._convert(r[0], r[1], r[2])
+        return None
+    return scan(head, False), scan(tail, True)
 
 
 _CONT_RX = re.compile(r"^(\s|at |Caused by|\.\.\. \d+ (more|common)|Suppressed:|Traceback|\}|\])")
@@ -1031,13 +1170,31 @@ class Analyzer(object):
         self.no_ts_lines = 0
         self.total_events = 0
         self.tpl_overflow = 0
+        self.file_hosts = set()
 
     # ---------------------------------------------------------------- input
     def feed(self, path):
-        fmt = sniff_format(path)
-        info = {"path": path, "name": os.path.basename(path), "format": fmt, "records": 0,
-                "events": 0, "no_ts": 0, "first": None, "last": None}
+        name = os.path.basename(path)
+        info = {"path": path, "name": name, "source_name": log_base_name(name), "format": "?", "records": 0,
+                "events": 0, "no_ts": 0, "first": None, "last": None, "skipped": None}
         self.files.append(info)
+        if name.lower().endswith(SKIP_EXT) or looks_binary(path):
+            info["skipped"] = "not a text log"
+            return
+        fmt = info["format"] = sniff_format(path)
+        if fmt == "raw":
+            first_ts, last_ts = quick_time_range(path, self.tp)
+            margin = dt.timedelta(minutes=10)
+            if first_ts and last_ts and (last_ts < self.b_start - margin or first_ts > self.w_end + margin):
+                info["skipped"] = "outside the analysis period"
+                info["first"], info["last"] = first_ts, last_ts
+                for t in (first_ts, last_ts):
+                    if self.data_min is None or t < self.data_min:
+                        self.data_min = t
+                    if self.data_max is None or t > self.data_max:
+                        self.data_max = t
+                return
+        self.file_hosts.add(info["source_name"])
         pend = None
         for ref, text, tstr, host, source, level in iter_records(path, fmt):
             info["records"] += 1
@@ -1097,7 +1254,7 @@ class Analyzer(object):
         full = "\n".join(lines)
         host = host or guess_host(first, span)
         if not host:
-            host = os.path.basename(str(source)) if source else info["name"]
+            host = log_base_name(os.path.basename(str(source))) if source else info["source_name"]
         self._consume(ts, span, ref, info["name"], host, first, full, level)
 
     def _consume(self, ts, span, ref, fname, host, first, full, level_field):
@@ -1264,6 +1421,19 @@ class Analyzer(object):
         vol = 1 + min(math.log10(max(f["count"], 1)), 3) * 0.15
         f["score"] = round(SEV_WEIGHT[f["sev"]] * self._rel(f["rel_cat"]) * timing * NOVELTY[f["status"]] * role * vol, 2)
 
+    @staticmethod
+    def silence_groups(silences, tol=90):
+        """Group gaps from different hosts/files that start and end at about the same time."""
+        groups = []
+        for s_ in sorted((x for x in silences if x["kind"] == "gap"), key=lambda x: x["start"]):
+            for g in groups:
+                if abs((s_["start"] - g[0]["start"]).total_seconds()) <= tol and abs((s_["end"] - g[0]["end"]).total_seconds()) <= tol:
+                    g.append(s_)
+                    break
+            else:
+                groups.append([s_])
+        return groups
+
     def _clean(self, items):
         return [(i[0], i[1], i[2], clean_text(i[3], self.redact)) for i in items]
 
@@ -1402,8 +1572,8 @@ class Analyzer(object):
                 ag = Agg()
                 ag.count, ag.first, ag.last = len(low), low[0][0], low[-1][0]
                 f = self._finding("traffic_drop", "Incoming requests dropped sharply", "http", "medium",
-                                  "For %d minute(s) the web logs saw less than 20%% of normal traffic - users may not have been able to reach the site at all (DNS, network, load balancer or upstream problem)." % len(low),
-                                  "Check DNS, network, load balancer and firewall status at that time.",
+                                  "For %d minute(s) the access logs saw less than 20%% of normal traffic. Either the server itself was down (see Log silences) or users could not reach it (DNS, network, load balancer)." % len(low),
+                                  "If logs went silent at the same time, the server was down; otherwise check DNS, network, load balancer and firewall at that time.",
                                   ag, 0, win_min, base_min,
                                   count_label="%d low-traffic minute(s)" % len(low))
                 f["status"] = "NEW"
@@ -1500,7 +1670,7 @@ class Analyzer(object):
         names = [h for h, _ in hosts]
         if not names:
             return ""
-        fnames = {f["name"] for f in self.files}
+        fnames = self.file_hosts | {f["name"] for f in self.files}
         prep = "in" if names[0] in fnames else "on"
         txt = ", ".join(names[:3])
         if len(names) > 3:
@@ -1579,13 +1749,26 @@ class Analyzer(object):
                 t0 = min(trig, key=lambda f: f["first"])
                 headline += " It was preceded by: %s at %s, which likely triggered it." % (t0["title"], fmt_hms(t0["first"], self._multi()))
             why.append("%s: %s." % (top["title"], self._status_phrase(top)))
+            if top.get("also"):
+                why.append("The same log lines also show: %s." % "; ".join(top["also"]))
+            warn = [f for f in cands if f is not top and f not in trig and f["status"] in ("NEW", "SPIKE")
+                    and top["first"] - dt.timedelta(minutes=30) <= f["first"] < top["first"] - dt.timedelta(seconds=30)]
+            if warn:
+                warn.sort(key=lambda f: f["first"])
+                why.append("Warning signs beforehand: %s." % "; ".join(
+                    "%s from %s" % (f["title"], fmt_hms(f["first"], self._multi())) for f in warn[:3]))
             if top["first"] <= inc + TWO_MIN:
                 why.append("It started before the problem was reported (%s)." % rel_phrase(top["first"], inc))
             else:
                 why.append("It only appeared after the reported time, so it may be a consequence rather than the cause.")
             if near:
                 s = near[0]
-                why.append("Backed up by a logging silence on %s (%s with no logs)." % (s["host"], fmt_dur(s["dur"])))
+                together = [x for x in near if abs((x["start"] - s["start"]).total_seconds()) <= 90]
+                if len(together) > 1:
+                    why.append("Backed up by %d log sources going silent together at %s (about %s with no logs)."
+                               % (len(together), fmt_hms(s["start"], self._multi()), fmt_dur(max(x["dur"] for x in together))))
+                else:
+                    why.append("Backed up by a logging silence on %s (%s with no logs)." % (s["host"], fmt_dur(s["dur"])))
             if restarts:
                 why.append("Backed up by a restart at %s." % fmt_hms(restarts[0][0], self._multi()))
             after = [f for f in cands if f["symptom"] and top["first"] <= f["first"] <= top["first"] + dt.timedelta(minutes=10)]
@@ -1628,13 +1811,25 @@ class Analyzer(object):
             chain += change[:1]
             chain.sort(key=lambda f: f["first"])
             for f in chain:
-                tag = " (symptom - what users/other systems felt)" if f.get("symptom") else ""
+                tag = " (symptom, not the root cause)" if f.get("symptom") else ""
                 events.append((f["first"], "%s - %s%s: %s, %s."
                                % (fmt_hms(f["first"], mt), self._name(f), tag, self._count_txt(f), self._status_phrase(f))))
-        for s in silences:
-            if s["kind"] == "gap":
+        for g in self.silence_groups(silences):
+            s = g[0]
+            if len(g) == 1:
                 events.append((s["start"], "%s - %s wrote NO logs for %s (until %s). For comparison, %s. Silence like this usually means the application/server was down, frozen or restarting."
                                % (fmt_hms(s["start"], mt), s["host"], fmt_dur(s["dur"]), fmt_hms(s["end"], mt), s["basis"])))
+            else:
+                names = [x["host"] for x in g]
+                lo, hi = min(x["dur"] for x in g), max(x["dur"] for x in g)
+                events.append((min(x["start"] for x in g),
+                               "%s - %d log sources went silent at the same moment (%s) for %s (until about %s). Everything stopping together means the whole process or server was down, not just one component."
+                               % (fmt_hms(min(x["start"] for x in g), mt), len(g), ", ".join(names[:6]) + (" ..." if len(names) > 6 else ""),
+                                  fmt_dur(lo) if abs(hi - lo) < 30 else "%s-%s" % (fmt_dur(lo), fmt_dur(hi)),
+                                  fmt_hms(max(x["end"] for x in g), mt))))
+        for s in silences:
+            if s["kind"] == "gap":
+                continue
             elif s["kind"] == "tail":
                 events.append((s["start"], "%s - %s stopped logging and did not log again before %s, while other logs carried on. It most likely went down and stayed down."
                                % (fmt_hms(s["start"], mt), s["host"], fmt_hms(s["end"], mt))))
@@ -1697,11 +1892,18 @@ class Analyzer(object):
                 items.append({"ts": f["first"], "host": ev["host"] if ev else "", "kind": f["sev"],
                               "text": "First: %s" % f["title"],
                               "ref": ("%s (%s)" % (ev["ref"], ev["file"])) if ev and ev["file"] else ""})
+        for g in self.silence_groups(R["silences"]):
+            st = min(x["start"] for x in g)
+            en = max(x["end"] for x in g)
+            who = g[0]["host"] if len(g) == 1 else "%d sources" % len(g)
+            items.append({"ts": st, "host": who, "kind": "silence",
+                          "text": "Logs go silent for %s%s" % (fmt_dur((en - st).total_seconds()),
+                                                               "" if len(g) == 1 else " (" + ", ".join(x["host"] for x in g[:5]) + ")"),
+                          "ref": ""})
+            items.append({"ts": en, "host": who, "kind": "resume", "text": "Logging resumes", "ref": ""})
         for s in R["silences"]:
             if s["kind"] == "gap":
-                items.append({"ts": s["start"], "host": s["host"], "kind": "silence",
-                              "text": "Logs go silent for %s" % fmt_dur(s["dur"]), "ref": ""})
-                items.append({"ts": s["end"], "host": s["host"], "kind": "resume", "text": "Logging resumes", "ref": ""})
+                continue
             elif s["kind"] == "tail":
                 items.append({"ts": s["start"], "host": s["host"], "kind": "silence", "text": "Logs stop (never resume in window)", "ref": ""})
             else:
@@ -1777,6 +1979,11 @@ class Analyzer(object):
                 g.append("Log timestamps carry timezone %s. Your time was assumed to be on the same clock; if you meant another timezone, re-run with --tz." % zones)
         elif self.target_offset is not None and not offs:
             g.append("Logs have no timezone information; they were assumed to already be in %s." % fmt_off(self.target_offset))
+        skipped = [f for f in self.files if f.get("skipped")]
+        if skipped:
+            reasons = collections.Counter(f["skipped"] for f in skipped)
+            g.append("Skipped %s: %s." % ("{:,} file(s)".format(len(skipped)),
+                                          "; ".join("%d %s" % (c, r) for r, c in reasons.items())))
         if self.tp.yearless:
             g.append("Some timestamps have no year (syslog style); year %d was assumed." % self.incident.year)
         for f in self.files:
@@ -1869,7 +2076,13 @@ def render_text(R, paint, width):
     out.append(" Reported : \"%s\" at %s" % (R["reason"], fmt_full(R["incident"])))
     out.append(" Window   : %s -> %s" % (fmt_full(R["window"][0]), fmt_full(R["window"][1])))
     out.append(" Baseline : %s" % (("%s -> %s" % (fmt_full(R["baseline"][0]), fmt_full(R["baseline"][1]))) if R["baseline"] else "none available"))
-    out.append(" Files    : %s" % ", ".join("%s (%s, %s events)" % (f["name"], f["format"], "{:,}".format(f["events"])) for f in R["files"]))
+    used = [f for f in R["files"] if not f.get("skipped")]
+    skipped = [f for f in R["files"] if f.get("skipped")]
+    out.append(" Files    : %s" % (", ".join("%s (%s, %s events)" % (f["name"], f["format"], "{:,}".format(f["events"])) for f in used[:12])
+                                   + (" ... +%d more" % (len(used) - 12) if len(used) > 12 else "")))
+    if skipped:
+        reasons = collections.Counter(f["skipped"] for f in skipped)
+        out.append(" Skipped  : %s" % "; ".join("%d file(s) %s" % (c, r) for r, c in reasons.items()))
     if R["reason_labels"]:
         out.append(" Read as  : %s" % ", ".join(R["reason_labels"]))
 
@@ -2200,9 +2413,11 @@ def render_html(R):
 
     a('<section><h2>Files analysed</h2><div class="tw"><table><tr><th>File</th><th>Format</th><th>Events</th><th>No timestamp</th><th>Covers</th></tr>')
     for f in R["files"]:
-        a("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"t\">%s &rarr; %s</td></tr>" % (
-            _h(f["name"]), _h(f["format"]), "{:,}".format(f["events"]), "{:,}".format(f["no_ts"]),
-            _h(fmt_full(f["first"])), _h(fmt_full(f["last"]))))
+        cov = "%s &rarr; %s" % (_h(fmt_full(f["first"])), _h(fmt_full(f["last"]))) if f["first"] else "-"
+        if f.get("skipped"):
+            cov += ' <span class="ref">(skipped: %s)</span>' % _h(f["skipped"])
+        a("<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td class=\"t\">%s</td></tr>" % (
+            _h(f["name"]), _h(f["format"]), "{:,}".format(f["events"]), "{:,}".format(f["no_ts"]), cov))
     a("</table></div></section>")
     a("<footer>Generated %s by %s on this machine &middot; no data was sent anywhere &middot; secrets in evidence are masked</footer>" % (_h(R["generated"]), _h(R["tool"])))
     a("</div></body></html>")
@@ -2220,12 +2435,23 @@ def expand_paths(items):
             hits = sorted(x for x in glob.glob(p) if os.path.isfile(x))
             (found.extend(hits) if hits else missing.append(it))
         elif os.path.isdir(p):
-            found.extend(sorted(os.path.join(p, n) for n in os.listdir(p) if os.path.isfile(os.path.join(p, n))))
+            for root, dirs, names in os.walk(p):
+                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                for n in sorted(names):
+                    fp = os.path.join(root, n)
+                    if not n.startswith(".") and not n.lower().endswith(SKIP_EXT) and os.path.isfile(fp):
+                        found.append(fp)
         elif os.path.isfile(p):
             found.append(p)
         else:
             missing.append(it)
-    return found, missing
+    seen, uniq = set(), []
+    for f in found:
+        if f not in seen:
+            seen.add(f)
+            uniq.append(f)
+    uniq.sort(key=rotation_key)
+    return uniq, missing
 
 
 def _ask(prompt):

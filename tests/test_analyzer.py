@@ -64,9 +64,10 @@ class Signatures(unittest.TestCase):
     def test_keyword_gate_matches_full_regex(self):
         """The fast keyword pre-check must never hide a regex match."""
         lines = []
-        for f in os.listdir(SAMPLES):
-            with open(os.path.join(SAMPLES, f), errors="replace") as fh:
-                lines.extend(fh.read().splitlines()[:5000])
+        for root, _, names in os.walk(SAMPLES):
+            for f in names:
+                with open(os.path.join(root, f), errors="replace") as fh:
+                    lines.extend(fh.read().splitlines()[:5000])
         for l in lines:
             fast = {s.key for s in A.match_signatures(l)}
             slow = {s.key for s in A.SIGS if s.rx.search(l)}
@@ -84,14 +85,49 @@ class Signatures(unittest.TestCase):
             "Failed password for invalid user admin from 1.2.3.4": "auth_fail",
             "group=queue, name=indexqueue, blocked=true": "splunk_queue",
             "EventCode=6008 The previous system shutdown was unexpected": "unexpected_shutdown",
+            # Splunk's own logs
+            "Received fatal signal 6 (Aborted) on PID 4242.": "splunk_crash",
+            " Last errno: 12": "native_oom",
+            "WARN  TailReader - Could not send data to output queue (parsingQueue), retrying...": "splunk_queue",
+            'INFO  PeriodicHealthReporter - feature="Ingestion Latency" color=red': "splunk_health",
+            "WARN  CMMaster - event=handleReplicationError peer=idx02 status=Down": "splunk_cluster",
+            "WARN  DiskMon - MinFreeSpace=5000. The diskspace remaining=4812 is less than that threshold.": "splunk_disk",
         }
         for line, key in cases.items():
             self.assertIn(key, {s.key for s in A.match_signatures(line)}, line)
+
+    def test_no_false_matches(self):
+        self.assertEqual(A.match_signatures('INFO  PeriodicHealthReporter - feature="X" color=green'), [])
+        keys = {s.key for s in A.match_signatures("TcpInputProc - Queues blocked for more than 300 seconds")}
+        self.assertNotIn("hung_task", keys)          # Splunk queue message is not a frozen kernel task
 
     def test_secrets_masked(self):
         self.assertNotIn("S3cret", A.clean_text("db password=S3cret user=x", False))
         self.assertNotIn("abc.def.ghi", A.clean_text("Authorization: Bearer abc.def.ghijkl", False))
         self.assertIn("[email]", A.clean_text("user=dr.smith@clinic.org", True))
+
+
+class FileHandling(unittest.TestCase):
+    def test_crash_log_is_text_not_json(self):
+        d = tempfile.mkdtemp()
+        p = os.path.join(d, "crash-2026-10-09-14-05-12.log")
+        with open(p, "w") as fh:
+            fh.write("[build abc] 2026-10-09 14:05:12\nReceived fatal signal 6 (Aborted) on PID 1.\n")
+        self.assertEqual(A.sniff_format(p), "raw")
+        with open(p, "w") as fh:
+            fh.write('{"a": 1}\n{"a": 2}\n')
+        self.assertEqual(A.sniff_format(p), "json")
+
+    def test_rotated_files(self):
+        self.assertEqual(A.log_base_name("splunkd.log.3"), "splunkd.log")
+        self.assertEqual(A.log_base_name("access.log.2026-10-08.gz"), "access.log")
+        order = sorted(["x/splunkd.log", "x/splunkd.log.1", "x/splunkd.log.2"], key=A.rotation_key)
+        self.assertEqual(order, ["x/splunkd.log.2", "x/splunkd.log.1", "x/splunkd.log"])
+
+    def test_host_in_message_is_not_the_logging_server(self):
+        line = "10-09-2026 14:00:00.000 +0000 WARN  TcpOutputFd - Connection to host=10.0.2.5:9997 failed"
+        self.assertIsNone(A.guess_host(line, (0, 29)))
+        self.assertEqual(A.guess_host("Oct  9 14:00:00 web01 kernel: x", (0, 15)), "web01")
 
 
 class Scenarios(unittest.TestCase):
@@ -113,6 +149,28 @@ class Scenarios(unittest.TestCase):
     def test_c_splunk_disk(self):
         R = run(["splunk_export.json"], "2026-10-09 18:10", "splunk not receiving data")
         self.assertEqual(R["findings"][0]["key"], "splunk_disk")
+
+    def test_d_splunk_internal_logs_folder(self):
+        folder = os.path.join(SAMPLES, "splunk_home", "var", "log", "splunk")
+        files, _ = A.expand_paths([os.path.join(SAMPLES, "splunk_home")])      # recursive, skips splunkd.pid
+        self.assertFalse(any(f.endswith(".pid") for f in files))
+        inc, _ = A.parse_user_time("2026-10-09 14:10")
+        an = A.Analyzer(inc, "splunk went down, searches not working")
+        for f in files:
+            an.feed(f)
+        R = an.report()
+        self.assertEqual(R["findings"][0]["key"], "splunk_crash")
+        self.assertEqual(R["verdict"]["confidence"], "High")
+        by_name = {f["name"]: f for f in R["files"]}
+        self.assertGreater(by_name["mongod.log"]["events"], 0)                    # KV store JSON format read
+        self.assertEqual(by_name["crash-2026-10-09-14-05-12.log"]["format"], "raw")
+        hosts = {h["host"] for h in R["hosts"]}
+        self.assertNotIn("10.0.2.5", hosts)                                      # host= inside a message
+        self.assertNotIn("web01", hosts)
+        self.assertNotIn("splunkd.log.1", hosts)                                 # rotated = same source
+        groups = A.Analyzer.silence_groups(R["silences"])
+        self.assertTrue(any(len(g) >= 4 for g in groups))                        # everything went quiet together
+        self.assertTrue(os.path.isdir(folder))
 
     def test_wrong_time_is_inconclusive(self):
         R = run(["app.log"], "2026-10-01 09:00", "server crashed")

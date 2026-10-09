@@ -1,0 +1,15 @@
+[build 1fff88043d5f] 2026-10-09 14:05:12
+Received fatal signal 6 (Aborted) on PID 4242.
+ Cause:
+   Signal sent by PID 4242 running under UID 1001.
+ Crashing thread: indexerPipe_1
+ Registers:
+    RIP:  [0x00007F5A1B2C3387] gsignal + 55 (libc.so.6 + 0x36387)
+ Backtrace (PIC build):
+  [0x00007F5A1B2C3387] gsignal + 55 (libc.so.6 + 0x36387)
+  [0x00007F5A1B2C4A78] abort + 328 (libc.so.6 + 0x37A78)
+  [0x000055D0A1B2C3D4] _ZN14IndexProcessor12flushBuffersEv + 212 (splunkd + 0x2B2C3D4)
+ Linux / idx01 / 4.18.0-513.el8.x86_64 / #1 SMP / x86_64
+ Last errno: 12
+ Threads running: 143
+ argv: [splunkd -p 8089 start]
