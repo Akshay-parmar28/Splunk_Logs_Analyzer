@@ -1,0 +1,8 @@
+Oct  9 13:10:00 web01 systemd[1]: Started Session 412 of user ops.
+Oct  9 13:40:00 web01 CRON[2211]: (root) CMD (/usr/local/bin/backup.sh)
+Oct  9 14:22:06 web01 kernel: [884512.1201] java invoked oom-killer: gfp_mask=0x100cca, order=0, oom_score_adj=0
+Oct  9 14:22:06 web01 kernel: [884512.1305] Out of memory: Killed process 4321 (java) total-vm:9123456kB, anon-rss:4120332kB
+Oct  9 14:22:07 web01 systemd[1]: tomcat.service: Main process exited, code=killed, status=9/KILL
+Oct  9 14:22:07 web01 systemd[1]: tomcat.service: Failed with result 'signal'.
+Oct  9 14:26:12 web01 systemd[1]: Starting Apache Tomcat Web Application Container...
+Oct  9 14:26:30 web01 systemd[1]: Started Apache Tomcat Web Application Container.

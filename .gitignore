@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+# reports generated when you run the tool
+incident_report_*.html
+*.json.out
+# large generated example (run examples/generate_samples.py to recreate)
+examples/samples/splunk_export.csv
