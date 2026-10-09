@@ -2497,36 +2497,36 @@
 2026-10-09 14:21:58,141 ERROR [http-nio-8080-exec-37] c.e.api.ReportService - Request failed for /api/v2/reports/export
 java.lang.OutOfMemoryError: Java heap space
 	at java.util.Arrays.copyOf(Arrays.java:3537)
-	at com.ecw.report.PdfExporter.render(PdfExporter.java:211)
-	at com.ecw.api.ReportService.export(ReportService.java:88)
+	at com.example.report.PdfExporter.render(PdfExporter.java:211)
+	at com.example.api.ReportService.export(ReportService.java:88)
 	... 42 more
 2026-10-09 14:22:00,343 INFO  [http-nio-8080-exec-20] c.e.api.PatientController - GET /api/v2/encounters/11623 completed in 154ms user=dr.smith9@clinic.org
 2026-10-09 14:22:00,343 ERROR [http-nio-8080-exec-1] c.e.api.ReportService - Request failed for /api/v2/reports/export
 java.lang.OutOfMemoryError: Java heap space
 	at java.util.Arrays.copyOf(Arrays.java:3537)
-	at com.ecw.report.PdfExporter.render(PdfExporter.java:211)
-	at com.ecw.api.ReportService.export(ReportService.java:88)
+	at com.example.report.PdfExporter.render(PdfExporter.java:211)
+	at com.example.api.ReportService.export(ReportService.java:88)
 	... 42 more
 2026-10-09 14:22:02,124 INFO  [http-nio-8080-exec-35] c.e.api.PatientController - GET /api/v2/encounters/37556 completed in 62ms user=dr.smith1@clinic.org
 2026-10-09 14:22:02,124 ERROR [http-nio-8080-exec-21] c.e.api.ReportService - Request failed for /api/v2/reports/export
 java.lang.OutOfMemoryError: Java heap space
 	at java.util.Arrays.copyOf(Arrays.java:3537)
-	at com.ecw.report.PdfExporter.render(PdfExporter.java:211)
-	at com.ecw.api.ReportService.export(ReportService.java:88)
+	at com.example.report.PdfExporter.render(PdfExporter.java:211)
+	at com.example.api.ReportService.export(ReportService.java:88)
 	... 42 more
 2026-10-09 14:22:04,506 INFO  [http-nio-8080-exec-1] c.e.api.PatientController - GET /api/v2/encounters/40692 completed in 178ms user=dr.smith4@clinic.org
 2026-10-09 14:22:04,506 ERROR [http-nio-8080-exec-17] c.e.api.ReportService - Request failed for /api/v2/reports/export
 java.lang.OutOfMemoryError: Java heap space
 	at java.util.Arrays.copyOf(Arrays.java:3537)
-	at com.ecw.report.PdfExporter.render(PdfExporter.java:211)
-	at com.ecw.api.ReportService.export(ReportService.java:88)
+	at com.example.report.PdfExporter.render(PdfExporter.java:211)
+	at com.example.api.ReportService.export(ReportService.java:88)
 	... 42 more
 2026-10-09 14:22:05,882 INFO  [http-nio-8080-exec-9] c.e.api.PatientController - GET /api/v2/encounters/25787 completed in 136ms user=dr.smith2@clinic.org
 2026-10-09 14:22:05,882 ERROR [http-nio-8080-exec-10] c.e.api.ReportService - Request failed for /api/v2/reports/export
 java.lang.OutOfMemoryError: Java heap space
 	at java.util.Arrays.copyOf(Arrays.java:3537)
-	at com.ecw.report.PdfExporter.render(PdfExporter.java:211)
-	at com.ecw.api.ReportService.export(ReportService.java:88)
+	at com.example.report.PdfExporter.render(PdfExporter.java:211)
+	at com.example.api.ReportService.export(ReportService.java:88)
 	... 42 more
 2026-10-09 14:26:31,656 INFO  [http-nio-8080-exec-24] c.e.api.PatientController - GET /api/v2/encounters/24117 completed in 40ms user=dr.smith5@clinic.org
 2026-10-09 14:26:31,656 INFO  [main] o.a.catalina.startup.Catalina - Server startup in 15234 ms

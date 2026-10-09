@@ -42,8 +42,8 @@ while t < end:
         app.append(f"{ts} ERROR [http-nio-8080-exec-{random.randint(1,40)}] c.e.api.ReportService - Request failed for /api/v2/reports/export")
         app.append("java.lang.OutOfMemoryError: Java heap space")
         app.append("\tat java.util.Arrays.copyOf(Arrays.java:3537)")
-        app.append("\tat com.ecw.report.PdfExporter.render(PdfExporter.java:211)")
-        app.append("\tat com.ecw.api.ReportService.export(ReportService.java:88)")
+        app.append("\tat com.example.report.PdfExporter.render(PdfExporter.java:211)")
+        app.append("\tat com.example.api.ReportService.export(ReportService.java:88)")
         app.append("\t... 42 more")
     if restart <= t < restart + dt.timedelta(seconds=3):
         app.append(f"{ts} INFO  [main] o.a.catalina.startup.Catalina - Server startup in 15234 ms")
